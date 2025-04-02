@@ -1,8 +1,6 @@
 import pandas as pd
 import json
-from langchain_core.prompts import ChatPromptTemplate
-import os
-import random
+import config
 from dotenv import load_dotenv
 from preprocess import store, load_source_file, preprocess_data
 load_dotenv()
@@ -11,108 +9,37 @@ from collections import defaultdict
 
 from langchain_openai import AzureChatOpenAI
 
-llm = AzureChatOpenAI(
-    deployment_name="gpt-4o",
-    model_name="gpt-4o",  # or "gpt-4"
-    azure_endpoint="https://triplei-openai.openai.azure.com/",
-    openai_api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-    openai_api_version="2024-12-01-preview",
-    openai_api_type="azure"
-)
 
-def describe_dct(df_dct:dict) -> dict:
-    sample_dict = {
-        col: random.sample(values, min(5, len(values)))
-        for col, values in df_dct.items()
-    }
-    prompt_template = ChatPromptTemplate.from_template(
-        """
-        You are given a dictionary where each key is a column name and its value contains:
-        - The column name again (redundant for clarity)
-        - A short list of example values
-        
-        Your task is to describe what each column represents in plain English (one sentence per column).
-        
-        Return a valid JSON object with the following format:
-        parentheses: 
-          "ColumnName1": "Short description of what ColumnName1 represents",
-          "ColumnName2": "Short description of what ColumnName2 represents",
-          ...
-        closed parentheses: 
-        
-        Only include column names as keys and their descriptions as string values. Do not include the example values in your output.
-        
-        Input:
-        {column_examples}
-
-        """
-    )
-
-    prompt = prompt_template.format_messages(
-            column_examples= json.dumps(sample_dict, indent=2)
-
-        )
-
-    try:
-        response = llm(prompt)
-        response_text = response.content.strip()
-
-        # Try to isolate valid JSON from GPT output
-        json_start = response_text.find("{")
-        if json_start != -1:
-            json_data = response_text[json_start:]
-            return json.loads(json_data)
-        else:
-            raise ValueError("No valid JSON found in GPT response")
-
-    except Exception as e:
-        print("❌ Error parsing GPT response:", e)
-        print("🔍 GPT raw output:\n", response_text if 'response_text' in locals() else "No response")
-        return {}
-
-def normalize_schema_dict(data_dict: dict, column_role_map: dict) -> dict:
-    """
-    Normalize a dictionary of lists using a role mapping like:
-    {"OriginalCol": "column_name", ...}
-    Only keeps recognized roles, renames keys.
-    """
-    return {
-        new_key: data_dict[old_key]
-        for old_key, new_key in column_role_map.items()
-        if new_key != "ignore" and old_key in data_dict
-    }
-
-def build_column_descriptions_from_dict(normalized_dict: dict) -> dict:
-    table_names = normalized_dict.get("table_name", [])
-    col_names = normalized_dict.get("column_name", [])
-    data_types = normalized_dict.get("data_type", [])
-
-    descriptions = {}
-
-    for table, col, dtype in zip(table_names, col_names, data_types):
-        descriptions[col] = f"{dtype} column in {table}"
-
-    return descriptions
-
-
-def generate_column_mapping_with_openai(df, destination_schema_description):
+def generate_column_mapping_with_openai(df, destination_schema_description, table_column_map):
     """
     Uses OpenAI to map source DataFrame columns to destination schema tables and columns.
     Returns a mapping dictionary: {source_column: {table: ..., column: ...}}
     """
-    # with open("prompts/column_mapping.txt", "r", encoding="utf-8") as f:
-    #     prompt = ChatPromptTemplate.from_template(f.read())
+
 
     prompt = f"""
-    You are a data integration assistant. Your task is to help map the columns from a source dataset into a fixed destination schema for sustainability reporting.
+    You are a data integration assistant. Your task is to help map the columns from a source dataset into a fixed destination schema for reporting.
 
     Destination schema (summarized):
     {destination_schema_description}
+    
+    Here are the available destination tables and their columns:
+    """
+    for table, columns in table_column_map.items():
+        prompt += f"\n{table}: {', '.join(columns)}"
 
+    prompt += """
     Below are the source dataset column names and sample values. Please suggest the most appropriate destination table and column for each source column.
 
-    Format your response as:
+    Format your response using **only this format**, one per line:
+
     column_name -> table_name.column_name
+    
+    For uncertain or irrelevant columns:
+    - If you're unsure or need manual review:  
+      column_name -> Unclear (needs review)
+    
+    ⚠️ Do not use bullet points, Markdown, quotes, or formatting. Just plain mappings.
 
     Source columns:
     """
@@ -135,9 +62,13 @@ def generate_column_mapping_with_openai(df, destination_schema_description):
         if "->" in line:
             source, target = line.split("->")
             source = source.strip()
-            table, column = target.strip().split(".", 1)
+            target = target.strip()
 
-            mapping[source] = {"table": table.strip(), "column": column.strip()}
+            if "." in target:
+                table, column = target.split(".", 1)
+                mapping[source] = {"table": table.strip(), "column": column.strip()}
+            else:
+                mapping[source] = {"table": target, "column": ""}
 
     return mapping
 
@@ -158,7 +89,7 @@ def clean_mapping_dict(raw_mapping_dict):
         column = value["column"].strip()
 
         # Skip non-applicable rows
-        if "not applicable" in table.lower():
+        if "unclear" in table.lower():
             continue
 
         # Remove extra explanation in parentheses from column
@@ -188,7 +119,6 @@ def split_dataframe_by_mapping(df, cleaned_mapping):
 
     # Convert column dicts to DataFrames
     return {table: pd.DataFrame(data) for table, data in table_dfs.items()}
-
 
 def export_to_excel_with_sheets(table_dfs, output_path):
     """
@@ -235,63 +165,71 @@ def extract_table_examples(data, max_rows=2):
 
     return result
 
+def extract_table_structure(data):
+    """
+    Extracts only table names and column names.
+
+    Args:
+        data: pd.DataFrame or dict of {sheet_name: pd.DataFrame}
+
+    Returns:
+        dict: {table_name: [column_name, ...]}
+    """
+    result = {}
+
+    if isinstance(data, dict):  # Excel with multiple sheets
+        for sheet_name, df in data.items():
+            if df.empty:
+                continue
+            result[sheet_name.strip()] = df.columns.astype(str).tolist()
+
+    elif isinstance(data, pd.DataFrame):  # Single CSV
+        result["SourceData"] = data.columns.astype(str).tolist()
+
+    else:
+        raise ValueError("Unsupported data type. Must be DataFrame or dict of DataFrames.")
+
+    return result
 
 
 if __name__ == "__main__":
+    llm = AzureChatOpenAI(
+        deployment_name=config.AZURE_OPENAI_DEPLOYMENT,
+        model_name=config.AZURE_OPENAI_MODEL,
+        azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
+        openai_api_key=config.AZURE_OPENAI_KEY,
+        openai_api_version=config.AZURE_OPENAI_VERSION,
+        openai_api_type=config.AZURE_OPENAI_TYPE,
+        temperature=0
+    )
 
-        df = load_source_file("cache/translated_df.csv")
-        df_dict = preprocess_data(df)
-        destination_tables = load_source_file('data/DestinationTables.xlsx')
-        table_examples_text = extract_table_examples(destination_tables, max_rows=2)
-        with open("cache/table_examples.txt", "w", encoding="utf-8") as f:
-            f.write(table_examples_text)
-
-        with open('cache/table_examples.txt', 'r') as f:
-            table_examples = f.read()
-
-        print(table_examples)
+    df = load_source_file(config.TRANSLATED_MAP_OUTPUT_PATH)
+    df, logs = preprocess_data(df)
 
 
-        with open('prompts/schema_description.txt', 'r', encoding="utf-8") as f:
-            schema_description = f.read()
-        # mappings = generate_column_mapping_with_openai(df_dict, schema_description)
-        # store(mappings, 'cache/mapping.json')
-        with open('cache/mapping.json', 'r', encoding="utf-8") as f:
-            mapping = json.load(f)
-        # print(mapping)
 
-        # clean_mapping = clean_mapping_dict(mapping)
-        # store(clean_mapping, 'cache/clean_mapping.json')
-        with open('cache/clean_mapping.json', 'r', encoding="utf-8") as f:
-            clean_mapping = json.load(f)
-        # print(clean_mapping)
-        #
-        # destination_dfs = split_dataframe_by_mapping(df, clean_mapping)
-        #
-        # export_to_excel_with_sheets(destination_dfs, "data/output/mapped_output.xlsx")
-        #
-        # print(destination_dfs)
-        # schema = pd.read_excel("data/source/DestinationSchema.xlsx")
-        # df_dct = df.to_dict(orient="list")
-        # schema = schema.dropna(axis=1)
-        # schema_dct = schema.to_dict(orient="list")
+    destination_tables_example = load_source_file(config.DESTINATION_TABLES_PATH)
 
-        # source_descriptions = describe_dct(df_dct)
-        # store(source_descriptions, 'cache/source_descriptions.json')
-        # with open('cache/source_descriptions.json', 'r', encoding="utf-8") as f:
-        #     source_descriptions = json.load(f)
-        # print(source_descriptions)
-        # schema_descriptions = describe_dct(schema_dct)
-        # store(schema_descriptions, 'cache/schema_descriptions.json')
-        # with open('cache/schema_descriptions.json', 'r', encoding="utf-8") as f:
-        #     schema_descriptions = json.load(f)
-        # col_mappings = generate_schema_column_roles(schema_dct)
-        # store(col_mappings, 'cache/col_mappings.json')
-        # with open('cache/col_mappings.json', 'r', encoding="utf-8") as f:
-        #     col_mappings = json.load(f)
-        # print(col_mappings)
-        # normalized_df = normalize_schema_dict(schema_dct, col_mappings)
-        # col_descr = build_column_descriptions_from_dict(normalized_df)
-        # print(col_descr)
-        # mapping = map_columns_to_schema(source_descriptions, col_descr)
-        # print(mapping)
+    table_columns = extract_table_structure(destination_tables_example)
+    store(table_columns, 'cache/table_columns.json')
+
+    with open('cache/table_columns.json', 'r', encoding="utf-8") as f:
+        table_columns = json.load(f)
+
+    with open(config.PROMPT_SCHEMA_DESCRIPTION, 'r', encoding="utf-8") as f:
+        schema_description = f.read()
+
+    mappings = generate_column_mapping_with_openai(df, schema_description, table_columns)
+    store(mappings, 'cache/mapping.json')
+    with open('cache/mapping.json', 'r', encoding="utf-8") as f:
+        mapping = json.load(f)
+
+    clean_mapping = clean_mapping_dict(mapping)
+    store(clean_mapping, 'cache/clean_mapping.json')
+
+    with open('cache/clean_mapping.json', 'r', encoding="utf-8") as f:
+        clean_mapping = json.load(f)
+
+    destination_dfs = split_dataframe_by_mapping(df, clean_mapping)
+    print(clean_mapping)
+    export_to_excel_with_sheets(destination_dfs, config.MAPPED_OUTPUT_PATH)

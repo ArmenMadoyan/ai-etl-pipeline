@@ -2,7 +2,7 @@ import pandas as pd
 import os
 import json
 import numpy as np
-
+import config
 
 def load_source_file(filepath):
     """
@@ -90,6 +90,8 @@ def preprocess_data(df):
 
     return df, log
 
+
+
 def store(new_data: dict, filename: str):
     def convert(obj):
         if isinstance(obj, pd.Timestamp):
@@ -110,13 +112,12 @@ def store(new_data: dict, filename: str):
 
 if __name__ == "__main__":
 
-    source_path = "data/source/SourceData.csv"  # or use .csv if applicable
+
+    source_path = config.DESTINATION_TABLES_PATH
     df = load_source_file(source_path)
-    clean_df, logs = preprocess_data(df)
+
+    clean_df, logs = preprocess_multiple_sheets(df)
     for entry in logs:
         print("[LOG]", entry)
-    print(clean_df.head())
     print(clean_df.columns)
 
-
-    # store(clean_df.to_csv(), 'cache/clean_df.csv')

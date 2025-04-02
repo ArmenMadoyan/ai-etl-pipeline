@@ -1,28 +1,14 @@
-import pandas as pd
 import random
-import re
 import json
-from langchain_core.prompts import ChatPromptTemplate
-from typing import List, Dict
-import os
-from dotenv import load_dotenv
 import requests
-load_dotenv()
 import time
-
+import config
+from typing import Dict
+from preprocess import store, load_source_file, preprocess_data
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import AzureChatOpenAI
 
-llm = AzureChatOpenAI(
-    deployment_name="gpt-4o",
-    model_name="gpt-4o",  # or "gpt-4"
-    azure_endpoint="https://triplei-openai.openai.azure.com/",
-    openai_api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-    openai_api_version="2024-12-01-preview",
-    openai_api_type="azure"
-)
-
-
-def extract_unique_text_values(df, log_interval=1):
+def extract_unique_text_values(df):
     """
     Extract unique non-null string values from all text (object) columns.
     Logs progress for each column including number of duplicates removed.
@@ -47,10 +33,10 @@ def extract_unique_text_values(df, log_interval=1):
     print("✅ Done extracting unique values from all text columns.\n")
     return unique_values
 
-def classify_text_columns(columns: Dict[str, List[str]]) -> Dict[str, str]:
+def classify_text_columns(columns, prompt_text) -> Dict[str, str]:
     # Template prompt for classification
-    with open("prompts/text_column_classifier.txt", "r", encoding="utf-8") as f:
-        prompt_template = ChatPromptTemplate.from_template(f.read())
+
+    prompt_template = ChatPromptTemplate.from_template(prompt_text)
 
     results = {}
     for col, values in columns.items():
@@ -68,10 +54,10 @@ def classify_text_columns(columns: Dict[str, List[str]]) -> Dict[str, str]:
             results[col] = "ERROR"
     return results
 
-def detect_non_english_columns(columns: Dict[str, List[str]]) -> Dict[str, str]:
+def detect_non_english_columns(columns, prompt_text) -> Dict[str, str]:
     # Template prompt for classification
-    with open("prompts/detect_language.txt", "r", encoding="utf-8") as f:
-        prompt_template = ChatPromptTemplate.from_template(f.read())
+
+    prompt_template = ChatPromptTemplate.from_template(prompt_text)
 
     results = {}
     for col, values in columns.items():
@@ -163,65 +149,79 @@ def text_translate_to_english(text, subscription_key, endpoint, region):
         return text  # fallback
 
 if __name__ == "__main__":
-    from preprocess import store, load_source_file, preprocess_data
 
-    source_path = "data/source/SourceData.csv"  # or use .csv if applicable
+    subscription_key = config.AZURE_TRANSLATE_KEY
+    endpoint = config.AZURE_TRANSLATE_ENDPOINT
+    region = config.AZURE_TRANSLATE_REGION
+    source_path = config.SOURCE_FILE_PATH  # or use .csv if applicable
+
+
+    llm = AzureChatOpenAI(
+        deployment_name=config.AZURE_OPENAI_DEPLOYMENT,
+        model_name=config.AZURE_OPENAI_MODEL,
+        azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
+        openai_api_key=config.AZURE_OPENAI_KEY,
+        openai_api_version=config.AZURE_OPENAI_VERSION,
+        openai_api_type=config.AZURE_OPENAI_TYPE,
+        temperature=0
+    )
+
     df_raw = load_source_file(source_path)
-
     df, logs = preprocess_data(df_raw)
 
-    # Store Unique values
-    # dct_unique = extract_unique_text_values(df)
-    # store(dct_unique, 'cache/unique_values.json')
-    with open('cache/unique_values.json', 'r') as f:
+    # ---------- Store unique values -----------------
+    dct_unique = extract_unique_text_values(df)
+    store(dct_unique, 'cache/unique_values.json')
+    with open('cache/unique_values.json', 'r',  encoding="utf-8") as f:
         unique_values = json.load(f)
 
+    # ---------- Create Mapping of columns Text / Non-Text -----------------
+    with open(config.PROMPT_TEXT_COLUMN_CLASSIFIER, "r", encoding="utf-8") as f:
+        prompt_text = f.read()
 
-    # clasified_columns = classify_text_columns(unique_values)
-    # text_columns = {col: label for col, label in clasified_columns.items() if label == "TEXT"}
-    #
-    # filtered_unique_values = {
-    #     col: values
-    #     for col, values in unique_values.items()
-    #     if col in text_columns
-    # }
-    # store(filtered_unique_values, 'cache/clasified_columns.json')
-    with open("cache/clasified_columns.json", "r") as f:
-        filtered_unique_values = json.load(f)
-    #
-    #
-    # non_english = detect_non_english_columns(filtered_unique_values)
-    # nonenglish = {col: label for col, label in non_english.items() if label == "NON-ENGLISH"}
-    # filtered_non_english = {
-    #     col: values
-    #     for col, values in unique_values.items()
-    #     if col in nonenglish
-    # }
+    clasified_columns = classify_text_columns(unique_values, prompt_text)
 
-    # store(filtered_non_english, "cache/non_english.json")
+    text_columns = {col: label for col, label in clasified_columns.items() if label == "TEXT"}
+
+    filtered_text_unique_values = {
+        col: values
+        for col, values in unique_values.items()
+        if col in text_columns
+    }
+    store(filtered_text_unique_values, 'cache/clasified_columns.json')
+    with open("cache/clasified_columns.json", "r",  encoding="utf-8") as f:
+        filtered_text_unique_values = json.load(f)
+
+    # ---------- Detect Non-English Words -----------------
+    with open(config.PROMPT_LANGUAGE_DETECTION, "r", encoding="utf-8") as f:
+        prompt_text = f.read()
+    non_english = detect_non_english_columns(filtered_text_unique_values, prompt_text)
+    nonenglish = {col: label for col, label in non_english.items() if label == "NON-ENGLISH"}
+    filtered_non_english = {
+        col: values
+        for col, values in unique_values.items()
+        if col in nonenglish
+    }
+    store(filtered_non_english, "cache/non_english.json")
     with open('cache/non_english.json', 'r', encoding="utf-8") as f:
         non_english = json.load(f)
+    # ---------- Translate The words , store the mappings -----------------
+    translated = translate_to_english(non_english, subscription_key, endpoint, region, batch_size = 100)
+    store(translated, 'cache/translated-map.json')
 
-
-    subscription_key = os.getenv('AZURE_TRANSLATE_API_KEY')
-    endpoint = 'https://api.cognitive.microsofttranslator.com/'
-    region = 'eastus'
-
-    # translated = translate_to_english(non_english, subscription_key, endpoint, region)
-    # store(translated, "cache/translated-map.json")
     with open('cache/translated-map.json', 'r', encoding="utf-8") as f:
         translation_maps = json.load(f)
-    # print(translation_maps.keys())
 
-    df_copy = df.copy()
+    # print(translation_maps.keys())
+    #
+    # print(df.columns)
 
     for col, value_map in translation_maps.items():
-        if col in df_copy.columns:
-            df_copy[col] = df_copy[col].map(lambda x: value_map.get(x, x))
+        if col in df.columns:
+            df[col] = df[col].map(lambda x: value_map.get(x, x))
             print(f"✅ Translated column: {col}")
         else:
             print(f"⚠️ Column '{col}' not found in DataFrame – skipped.")
 
+    df.to_csv(config.TRANSLATED_MAP_OUTPUT_PATH, index=False)
 
-
-    df_copy.to_csv('cache/translated_df.csv', index=False)

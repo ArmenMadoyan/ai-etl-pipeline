@@ -1,13 +1,9 @@
 import pandas as pd
-
+import json
+import config
+from preprocess import load_source_file, preprocess_data, store
 # Load the source data
-source_path = "data/source/SourceData.csv"  # or use .csv if applicable
-df = pd.read_csv(source_path)  # or pd.read_csv(source_path)
+source_path = config.SOURCE_FILE_PATH
+df = load_source_file(source_path)
+df,_ = preprocess_data(df)
 
-# Basic inspection
-print("Number of rows:", df.shape[0])
-print("Number of columns:", df.shape[1])
-print("\nColumn names:\n", df.columns.tolist())
-print("\nData types:\n", df.dtypes)
-print("\nMissing values per column:\n", df.isnull().sum())
-print("\nFirst 5 rows:\n", df.head())
