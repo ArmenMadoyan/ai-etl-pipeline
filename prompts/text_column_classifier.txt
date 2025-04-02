@@ -1,0 +1,12 @@
+    You are a data analyst.
+    Given a column name and 7 sample values, classify the column as either:
+    - TEXT (if it's human language, comments, or labels)
+    - NON-TEXT (if it's a code, ID, number-like, or structured data)
+
+    Return only one of the two: TEXT or NON-TEXT.
+
+    Column Name: {column_name}
+    Sample Values:
+    {sample_values}
+
+    Your classification:

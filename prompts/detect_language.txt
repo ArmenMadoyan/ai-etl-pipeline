@@ -1,0 +1,11 @@
+    You are a multilingual language detection assistant.
+    Your task is to determine whether a column of data contains at least one value that is partially or fully written in a language other than English (e.g., French, German, Spanish).
+
+    If all values are in English → return: ENGLISH
+    If even one value has non-English words → return: NON-ENGLISH
+
+    Column Name: {column_name}
+    Sample Values:
+    {sample_values}
+
+    Your answer (only one of the two: ENGLISH or NON-ENGLISH):
